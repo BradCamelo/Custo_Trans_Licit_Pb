@@ -15,6 +15,8 @@ library(scales)
 library(kknn)
 library(kernlab)
 library(e1071)
+library(stats)
+library(ggplot2)
 
 
 setwd("~/Dropbox/PPGMMC/Dissertação/Script/Custo_Trans_Licit_Pb")
@@ -38,9 +40,9 @@ df_top_padrao <- df_top_padrao %>%
 
 
 df_top_padrao <- df_top_padrao %>%
-  select( c(Custo_Tran_norm, Quantidade, idhm,idhm_edu, idhm_long,
-            idhm_renda, gini, area_km2, populacao, Tempo_Medio, 
-            distancia, ReceitaCorrente, Licit, n_licit, Precatorio) )
+  select( c(Custo_Tran_norm, Quantidade, idhm, gini, area_km2, 
+            populacao, Tempo_Medio, distancia, ReceitaCorrente, 
+            Licit, n_licit, Precatorio) )
 
 #data_subset <- data_subset %>% slice_sample(prop = 0.7)
 
@@ -85,15 +87,243 @@ df_train %>%
   corrplot(col = tmwr_cols(200), tl.col = "black", method = "ellipse")
 
 
-#É possível observar também que há poucos valores acima de 150, o que pode significar uma baixa 
-#performance dos modelos testados parar valores contidos nesse intervalo.
 
 ggplot(df_top_padrao, aes(Custo_Tran_norm)) +
   geom_density() +
-  xlim(0, 5) +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+  xlim(-3,4.5) +
   xlab("Custo de Transação Normalizado") +
   ylab("Densidade") +
   theme_bw()
+
+
+## Baseado no script do Gabriel
+
+# Modelo de regressão linear
+
+modelo <- lm(Custo_Tran_norm ~ Quantidade + idhm + populacao + Tempo_Medio + 
+               distancia + ReceitaCorrente + Licit +
+               n_licit + Precatorio, data = df_train)
+
+# Exibir o resumo do modelo
+
+summary(modelo)
+
+
+
+# Filtrar as colunas necessárias e criar o gráfico de pares
+
+df_train %>%
+  select(Custo_Tran_norm, idhm, populacao,
+         Tempo_Medio, distancia, ReceitaCorrente, Licit,
+         n_licit, Precatorio) %>%
+  ggpairs(axisLabels = "none") +
+  theme_bw()
+
+
+#Distribuição das variáveis independentes
+
+df_train %>%
+  select( c(Quantidade, `Município Destinatário`, idhm,
+            gini, area_km2, populacao, Tempo_Medio, distancia, 
+            ReceitaCorrente, Licit, n_licit, Precatorio) ) %>% 
+  select_if(is.numeric) |> 
+  gather(cols, value) |>
+  ggplot(aes(x = value)) + 
+  geom_density(color = "black") +
+  facet_wrap(.~cols, ncol = 3, nrow = 3, scales = "free") +
+  theme_bw() +
+  ylab("Densidade") +
+  xlab("Valor")
+
+# receita
+
+# Selecionar apenas colunas numéricas
+df_numeric <- df_train %>% select_if(is.numeric)
+
+# Calcular a assimetria e variância para cada variável numérica
+skewness_values <- sapply(df_numeric, skewness, na.rm = TRUE)
+variance_values <- sapply(df_numeric, var, na.rm = TRUE)
+
+
+# receita para random forest
+
+recipe_rf <- df_train |>
+  recipe(Custo_Tran_norm ~ .) |>
+  step_dummy(all_nominal_predictors()) |> 
+  step_impute_bag(all_numeric_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_nzv(all_predictors()) |>
+  step_factor2string(all_nominal_predictors()) |>
+  step_log(all_numeric(), -all_outcomes(), base = exp(1), 
+           where = function(x) {skewness(x, na.rm = TRUE) > 1 | 
+               skewness(x, na.rm = TRUE) < -1 }) |>
+  step_center(all_numeric_predictors()) |>
+  step_scale(all_numeric_predictors()) |>
+  step_rm(all_numeric_predictors(), -all_outcomes(), 
+          where = function(x) { var(x, na.rm = TRUE) < 1e-10 })
+
+# receita individual para lasso
+recipe_lasso <-  
+  df_train |>
+  recipe(Custo_Tran_norm ~ .) |>
+  # criar variáveis dummies com cada classe de variáveis categóricas
+  step_dummy(all_nominal_predictors()) |> 
+  step_impute_bag(all_numeric_predictors()) |>
+  step_normalize(all_numeric_predictors()) |> 
+  step_zv(all_predictors()) |>
+  step_nzv(all_predictors()) |> 
+  step_factor2string(all_nominal_predictors())
+
+# workflow
+# o workflow serve para juntar a parte de preprocessamento e o modelo a ser utilizado
+
+# workflow para random forest
+workflow_rf <- 
+  workflow() |>
+  # modelo random forest
+  add_model(rand_forest(mtry = tune(), trees = tune(), min_n = 2) |>
+              set_engine("ranger", importance = "impurity", seed = 1) |>
+              set_mode("regression")) |>
+  # adicionar receita 
+  add_recipe(recipe_rf)
+
+
+# workflow para lasso
+workflow_lasso <- workflow() |>
+  # modelo lasso
+  add_model(linear_reg(penalty = tune(), mixture = 1) |>
+              set_engine("glmnet")
+  ) |>
+  # adiciona receita do lasso
+  add_recipe(recipe_lasso)
+
+
+# a otimização do modelo pode ser feita utilizando grid search, encontrar a melhor combinação entre os hiperparametros do modelo
+
+# grid para random forest
+tree_grid <- grid_regular(trees(range = c(350, 1000)),
+                          mtry(range = c(7, 13)),
+                          levels = 5)
+
+# grid para lasso
+lasso_grid <- grid_regular(penalty(),
+                           levels = 50)
+
+# criação de fold para observar as métricas do modelo em cada fold e tomar o melhor entre eles
+folds <- vfold_cv(df_train, v = 5)
+
+# tunagem random forest
+tree_res <-
+  workflow_rf |>
+  tune_grid(
+    resamples = folds,
+    metrics = metric_set(rsq, rmse),
+    grid = tree_grid
+  )
+
+# tunagem lasso
+lasso_res <-
+  workflow_lasso |>
+  tune_grid(
+    resamples = folds,
+    metrics = metric_set(rsq, rmse),
+    grid = lasso_grid
+  )
+
+#Métricas para cada combinação no Grid Search RF
+
+tree_res %>%
+  collect_metrics() %>%
+  mutate(trees = factor(trees)) %>%
+  ggplot(aes(mtry, mean, color = trees)) +
+  geom_line(size = 1.5, alpha = 0.7) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0) +
+  ylab("Média") +
+  xlab("Quantidade de variáveis independentes") +
+  theme_bw()
+
+# Métricas para cada combinação no Grid Search em cada Fold (Lasso)
+
+lasso_res |> 
+  collect_metrics() |> 
+  ggplot(aes(penalty, mean)) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0) +
+  ylab("Média") +
+  xlab("Penalty") +
+  theme_bw()
+
+#Valores previstos x observados
+
+# modelo lasso com o melhor penalty encontrados pelo grid search
+final_wf_lasso <- 
+  workflow_lasso %>% 
+  finalize_workflow(
+    lasso_res |> 
+      select_best("rmse")
+  ) |> 
+  last_fit(df_split)
+
+
+# modelo random forest com os melhores hiperparametros encontrados pelo grid search
+final_wf_rf <- 
+  workflow_rf %>% 
+  finalize_workflow(
+    tree_res |> 
+      select_best(metric = "rmse")
+  ) |> 
+  last_fit(df_split)
+
+
+final_wf_rf |> 
+  collect_predictions() |>
+  ggplot(aes(Custo_Tran_norm, .pred))+
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "red",
+              size = 1.5, linetype = "dashed") +
+  theme_bw() +
+  ylab("Valores Previstos") +
+  xlab("Valores Observados")
+
+
+final_wf_lasso |> 
+  collect_predictions() |>
+  ggplot(aes(Custo_Tran_norm, .pred))+
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "red",
+              size = 1.5, linetype = "dashed") +
+  theme_bw() +
+  ylab("Valores Previstos") +
+  xlab("Valores Observados")
+
+#Variáveis mais importantes na Random Forest
+
+final_wf_rf |> 
+  extract_fit_engine() |> 
+  vip() +
+  theme_bw()
+
+# Previsões RF
+
+rf_fit <- fit(workflow_rf, train_data)
+
+
+predictions <- predict(rf_fit, test_data, type = "regression") %>%
+  bind_cols(test_data)
+
+# Calcular métricas
+results <- predictions %>%
+  metrics(truth = Custo_Tran_norm, estimate = .pred) %>%
+  add_metric(metric = rmse, truth = Custo_Tran_norm, estimate = .pred) %>%
+  add_metric(metric = rsq, truth = Custo_Tran_norm, estimate = .pred)
+
 
 
 ### RF
