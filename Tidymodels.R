@@ -46,7 +46,12 @@ df_top_padrao <- df_top_padrao %>%
 
 #data_subset <- data_subset %>% slice_sample(prop = 0.7)
 
-  
+df_top_padrao <- df_top_padrao %>%
+  mutate(across(where(is.numeric),
+                ~ ifelse(is.infinite(.), NA, .))) %>%
+  mutate(distancia = log(distancia + 1)) 
+
+
 set.seed(58046088)
 df_split <- initial_split(df_top_padrao, strata = Custo_Tran_norm, prop = 3/4)
 df_train <- training(df_split)
@@ -136,32 +141,34 @@ df_train %>%
   ylab("Densidade") +
   xlab("Valor")
 
-# receita
+## receita
 
 # Selecionar apenas colunas numéricas
 df_numeric <- df_train %>% select_if(is.numeric)
 
-# Calcular a assimetria e variância para cada variável numérica
+# Calcular a assimetria (skewness) e variância para cada variável numérica
 skewness_values <- sapply(df_numeric, skewness, na.rm = TRUE)
 variance_values <- sapply(df_numeric, var, na.rm = TRUE)
 
+# checagem
+print("Assimetria das variáveis:")
+print(skewness_values)
+print("Variância das variáveis:")
+print(variance_values)
 
-# receita para random forest
+# Identificar variáveis numéricas com assimetria significativa para transformação logarítmica
+numeric_skewed <- names(skewness_values[skewness_values > 1 | skewness_values < -1])
 
-recipe_rf <- df_train |>
-  recipe(Custo_Tran_norm ~ .) |>
+# Adicionar transformações ao recipe
+recipe_rf <- recipe(Custo_Tran_norm ~ ., data = df_train) |>
+  step_log(all_of(numeric_skewed), base = exp(1)) |>
   step_dummy(all_nominal_predictors()) |> 
   step_impute_bag(all_numeric_predictors()) |>
   step_zv(all_predictors()) |>
   step_nzv(all_predictors()) |>
-  step_factor2string(all_nominal_predictors()) |>
-  step_log(all_numeric(), -all_outcomes(), base = exp(1), 
-           where = function(x) {skewness(x, na.rm = TRUE) > 1 | 
-               skewness(x, na.rm = TRUE) < -1 }) |>
   step_center(all_numeric_predictors()) |>
-  step_scale(all_numeric_predictors()) |>
-  step_rm(all_numeric_predictors(), -all_outcomes(), 
-          where = function(x) { var(x, na.rm = TRUE) < 1e-10 })
+  step_scale(all_numeric_predictors())
+
 
 # receita individual para lasso
 recipe_lasso <-  
