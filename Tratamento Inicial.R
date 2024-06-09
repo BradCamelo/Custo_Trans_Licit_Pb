@@ -4,7 +4,8 @@ gc()
 library(tidyverse)
 library(dplyr)
 library(readxl)       
-library(geobr)      
+library(geobr)
+library(geosphere)
 library(tidyr)     
 library(ggplot2)      
 library(lubridate)   
@@ -12,7 +13,7 @@ library(stargazer)
 library(Metrics)
 library(np)
 library(locfit)
-
+ 
 setwd("~/Dropbox/PPGMMC/Dissertação/Script")
 
 setwd('C:/Users/brads/Dropbox/PPGMMC/Dissertação/Script')
@@ -239,147 +240,94 @@ nf_todas <- left_join(nf_total, liq, by = c("id_nfe" = "nu_ChaveAcesso"))
 
 ###
 
-# Identificar os 50 códigos EAN mais frequentes
-top_100_ean <- nf_total %>%
-  group_by(`Código EAN Produto`) %>%
-  summarise(Contagem = n()) %>%
-  arrange(desc(Contagem)) %>%
-  slice_head(n = 100)
-
-# Filtrar o dataframe original para manter apenas as observações com os 50 códigos EAN mais frequentes
-nf_filtrado <- nf_total %>%
-  dplyr::filter(`Código EAN Produto` %in% top_100_ean$`Código EAN Produto`)
 
 
 # Identificar a Unidade mais frequente para cada Código EAN Produto
-unidade_mais_frequente <- nf_filtrado %>%
+unidade_mais_frequente <- nf_todas %>%
   group_by(`Código EAN Produto`, Unidade) %>%
   summarise(Contagem = n(), .groups = 'drop') %>%
   arrange(`Código EAN Produto`, desc(Contagem)) %>%
-  mutate(rank = row_number()) %>%
-  filter(rank == 1) %>%
-  select(-Contagem, -rank)
+  group_by(`Código EAN Produto`) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(`Código EAN Produto`, Unidade)
+
+
 
 # Juntar essa informação com o dataframe original para filtrar as linhas
-nf_filtrado <- nf_filtrado %>%
+nf_ <- nf_todas %>%
   inner_join(unidade_mais_frequente, by = c("Código EAN Produto", "Unidade"))
 
 
 ###
 
 
-#Identificando os produtos mais comprados pelo EAN
+# Obter dados de localização dos municípios
+municipios <- read_municipal_seat()
 
-ean_mun <- nf_total |>
-  group_by(`Código EAN Produto`) |>
-  summarise(Municipios_Distintos = n_distinct(
-    `Código Município Destinatário`)) |>
-  arrange(desc(Municipios_Distintos))
+# Extrair a latitude e a longitude da coluna geom
+municipios <- municipios %>%
+  mutate(
+    lon = st_coordinates(geom)[, 1],
+    lat = st_coordinates(geom)[, 2]
+  )
 
-top_20_ean <- head(ean_mun$`Código EAN Produto`, 20)
+# Unir os dados para obter as coordenadas de origem e destino
+nf_ <- nf_ %>%
+  left_join(municipios, by = c("Código Município" = "code_muni")) %>%
+  rename(lat_origem = lat, lon_origem = lon) %>%
+  left_join(municipios, by = c("Código Município Destinatário" = "code_muni")) %>%
+  rename(lat_destino = lat, lon_destino = lon)
 
-top_20_ean
+# Função para calcular a distância entre duas coordenadas
+calcular_distancia <- function(lat1, lon1, lat2, lon2) {
+  distGeo(c(lon1, lat1), c(lon2, lat2)) / 1000 # Converte a distância para quilômetros
+}
 
-#pegando o produto mais comprado
-
-nf_top <- nf_total |>
-  filter(`Código EAN Produto` == "7897947706491")
+# Calcular a distância para cada linha do data frame
+nf_ <- nf_ %>%
+  rowwise() %>%
+  mutate(distancia = calcular_distancia(lat_origem, lon_origem, lat_destino, lon_destino)) %>%
+  ungroup()
 
 
 ## indentificando os municípios geograficamente
 
-pb <- read_state(code_state = "PB")
-
-mun <- read_municipality(code_muni = "all")
-
-# Outros dados dos municípios
-
-path <- 'C:/Users/brads/Dropbox/PPGMMC/Dissertação/Scrip/'
-
-data_pb <- read_csv("C:/Users/brads/Dropbox/PPGMMC/Dissertação/Script/Data_pb.csv") |>
+data_pb <- read_csv("~/Dropbox/PPGMMC/Dissertação/Data_pb.csv") |>
   filter(ano == 2013)
 
 # shapefile da Paraiba
 
 pbmap <- st_read("C:/Users/brads/Dropbox/PPGMMC/Dissertação/Script/PB_Municipios_2020.shp")
 
-
 #Unindo os dados
 
-geo_PB <- left_join(data_pb, pbmap, by = c("Cidade" = "NM_MUN"))
+dados <- nf_ |>
+  left_join(data_pb, by = c("Código Município Destinatário" = "cod_mundv"))
 
-nf_top <- nf_filtrado_2 |>
-  left_join(mun, by = c("Código Município" = "code_muni")) |>
-  rename(geom_origem = geom) |>
-  left_join(geo_PB, by = c("Código Município Destinatário" = "cod_mundv")) |>
-  rename(geom_destino = geometry)
-
-rm (data_pb, geo_PB, mun, pbmap)
-
-#Calculando a distância
-
-nf_top$distancia <- st_distance(nf_top$geom_origem, 
-                                nf_top$geom_destino, by_element = TRUE)
+rm (data_pb, nf_todas, nf_total, unidade_mais_frequente, liq)
 
 ###### LIMPEZA
 
-colnames(nf_top)
+colnames(dados)
 
-no_use <- c("id_nfe",  "Código Produto", "Código NCMP Produto",
-            "Código CEST Produto", "Data Emissão", "CNPJ Destinatário",
-            "Destinatário", "Cancelada?", "name_muni", "code_state",
-            "abbrev_state", "cod_uf", "nome_uf", "cod_mesoregiao",
-            "nome_mesorregiao", "cod_microrregiao", "nome_microregiao",
-            "cod_municipio", "Cidade",  "cod_sagres", "ano", "CD_MUN",
-            "SIGLA_UF", "AREA_KM2" )              
+no_use <- c("id_nfe", "Código Produto", "Código NCMP Produto",
+            "Código CEST Produto", "Descrição Produto", "Unidade",
+            "Valor Produtos", "Data Emissão", "Código Município",
+            "Município Emitente", "UF", "CNPJ Destinatário", "Destinatário",
+            "UF Destinatário", "Valor Total Produtos",
+            "Cancelada?", "Chave", "numero_empenho", "cpf_cnpj_credor",
+            "Valor_Liquidacao", "name_muni.x", "code_state.x", "abbrev_state.x",
+            "code_region.x", "name_region.x", "year.x", "geom.x", "lon_origem",
+            "lat_origem", "name_muni.y", "code_state.y", "abbrev_state.y",
+            "code_region.y", "name_region.y", "year.y", "geom.y", "lon_destino",
+            "lat_destino", "cod_uf", "nome_uf", "cod_mesoregiao",
+            "cod_microrregiao", "cod_municipio", "Cidade", "cod_sagres", "ano",
+            "idhm_long", "idhm_renda")              
 
 
-nf_top <- nf_top |>
+dados <- dados |>
   dplyr::select(-one_of(no_use))
-
-#tirar os produtos com EAN errados produto 1 (soro)
-
-nf_top$`Descrição Produto` <- toupper(nf_top$`Descrição Produto`)
-nf_top$Unidade <- toupper(nf_top$Unidade)
-
-nf_top_clean <- nf_top |>
-  filter(!(!grepl("500", `Descrição Produto`) |
-            grepl("DIPIRONA",`Descrição Produto`)|
-            grepl("GTS",`Descrição Produto`)|
-            grepl("LIDOCAINA",`Descrição Produto`)|
-            grepl("HIOSCINA",`Descrição Produto`)|
-             grepl("HIDROCORTISONA",`Descrição Produto`)|
-             grepl("AGUA",`Descrição Produto`)|
-             grepl("EPINEFRINA",`Descrição Produto`)|
-             grepl("DICLOFENACO",`Descrição Produto`)
-             ))
-
-# corrigir unidades produto 1 (soro)
-
-nf_top_clean <- nf_top_clean|>
-  mutate(Unidade = ifelse(`Unidade` %in% c("AM", "FR", "FR.",
-                                             "FRS", "PC", "FRA",
-                                             "UN", "FA", "UNID",
-                                           "UNITS", "F/A", "BOLSA",
-                                           "BLS", "BOLS", "TB",
-                                           "BOL", "F/B"), 
-                          "AMP",
-                          ifelse(`Unidade` == "UND" & 
-                                  `Valor Unitário` < 10, 
-                                 "AMP", 
-                                 `Unidade`)))|>
-  mutate(Unidade = gsub("CX1", "CX", Unidade)) |>
-  filter(!(`Unidade` == "UND" & `Valor Unitário` >= 10))
-
-#criar o preço
-
-nf_top_clean <- nf_top_clean |>
-  mutate(Preço = case_when(
-    Unidade == "AMP" ~ `Valor Unitário`,
-    Unidade == "CX" & grepl("24", `Descrição Produto`) ~ `Valor Unitário` / 24,
-    TRUE ~ `Valor Unitário` / 30
-  ))
-
 
 # Restos a pagar
 
@@ -420,7 +368,7 @@ nf_top <- left_join(
 
 saveRDS(nf_top, file = "nf_top.rds")
 
- 
+
 #### Choropleth
 
 pbmap$NM_MUN <- toupper(pbmap$NM_MUN)|>
@@ -433,7 +381,7 @@ Tempo_Medio_Pagamento <-
   left_join(pbmap, by = c("Municipio" = "NM_MUN"))
 
 
-  
+
 p1 <- Tempo_Medio_Pagamento|>
   filter(Ano_Pgto == 2019) |>
   ggplot(aes(geometry = geometry)) +
@@ -478,8 +426,8 @@ print(mapas_combinados)
 #Receita corrente líquida
 
 receita_corrente_2019_2023 <- read_excel("recita_corrente_2019-2023.xlsx", 
-                                        col_types = c("text", "text", "text", 
-                                                      "numeric"))
+                                         col_types = c("text", "text", "text", 
+                                                       "numeric"))
 
 
 receita_corrente_2019_2023 <- receita_corrente_2019_2023 |>
@@ -501,12 +449,12 @@ receita_corrente_2019_2023$no_municipio <- gsub(
 receita_corrente_2019_2023 <- receita_corrente_2019_2023 |>
   dplyr::select(-dt_mesano)
 
-nf_top <- nf_top |>
+dados <- dados |>
   left_join(receita_corrente_2019_2023, 
             by = c("Município Destinatário" = "no_municipio", 
                    "Ano" = "dt_Ano" , "Mês" = "mes" ))
 
-rm(df_filtrado, menor_valor_unitario)
+rm(municipios, receita_corrente_2019_2023)
 
 saveRDS(nf_top, file = "nf_top.rds")
 
@@ -522,82 +470,91 @@ meses_mapa <- c("jan" = 1, "fev" = 2, "mar" = 3, "abr" = 4,
                 "mai" = 5, "jun" = 6, "jul" = 7, "ago" = 8, 
                 "set" = 9, "out" = 10, "nov" = 11, "dez" = 12)
 
-  
+
 FIPE_19_23$Mês <- meses_mapa[FIPE_19_23$Mês]
 
-nf_top <- left_join(nf_top, FIPE_19_23, by = c("Ano", "Mês"))
+dados <- left_join(dados, FIPE_19_23, by = c("Ano", "Mês"))
 
 # Deflacionando os Preços da saúde
 
-nf_top$Preço <- nf_top$`Valor Unitário`
-  
-nf_top$Preço  <- nf_top$Preço / (1 + nf_top$GeralAc)
+dados$Preço <- dados$`Valor Unitário`
+
+dados$Preço  <- dados$Preço / (1 + dados$GeralAc)
 
 # Deflacionando a Receita 
 
-nf_top$ReceitaCorrente <- nf_top$ReceitaCorrente/
-  (1 + nf_top$GeralAc)
+dados$ReceitaCorrente <- dados$ReceitaCorrente/
+  (1 + dados$GeralAc)
 
 
-## Criando a variável Percentual de Custo de Transação
+## Criando a variável Custo de Transação Normalizado sem outliers
 
-# Calcular o menor "Preço" para cada "Código EAN Produto"
-menor_valor_unitario <- nf_top %>%
-  group_by(`Código EAN Produto`) %>%
-  summarise(MenorValorUnitario = min(Preço), .groups = 'drop')
-
-# Juntar essa informação com o dataframe original
-nf_top <- nf_top %>%
-  left_join(menor_valor_unitario, by = 'Código EAN Produto')
-
-# Calcular "Custo_Tran"
-
-# Filtrar a unidade mais frequente para cada código EAN
-
-unidade_mais_frequente <- nf_top %>%
-  group_by(`Código EAN Produto`) %>%
-  count(Unidade) %>%
-  arrange(`Código EAN Produto`, desc(n)) %>%
-  slice(1) %>%
-  ungroup() %>%
-  select(-n)
-
-
-df_top_padrao <- nf_top %>%
-  inner_join(unidade_mais_frequente, by = c("Código EAN Produto", "Unidade"))
-
-# Padronizar Custo de Transação
-
-# retirar outliers
-
-df_top_padrao <- df_top_padrao %>%
+dados <- dados %>%
   group_by(`Código EAN Produto`) %>%
   mutate(
-    Media_Valor_Unitario = mean(`Valor Unitário`, na.rm = TRUE),
-    SD_Valor_Unitario = sd(`Valor Unitário`, na.rm = TRUE),
-    Distancia_DP = abs(`Valor Unitário` - Media_Valor_Unitario)/
-      SD_Valor_Unitario  ) %>%
-  filter(Distancia_DP <= 3 | is.na(Distancia_DP)) %>%
-  select(-Media_Valor_Unitario, -SD_Valor_Unitario, -Distancia_DP) %>%
-  ungroup()
-
-#calcular
-df_top_padrao <- df_top_padrao %>%
-  group_by(`Código EAN Produto`) %>%
-  mutate(
-    Media_Valor_Unitario = mean(`Valor Unitário`, na.rm = TRUE),
-    SD_Valor_Unitario = sd(`Valor Unitário`, na.rm = TRUE),
-    Custo_Tran = (`Valor Unitário` - Media_Valor_Unitario) / SD_Valor_Unitario
+    media_preco = mean(Preço, na.rm = TRUE),
+    sd_preco = sd(Preço, na.rm = TRUE)
   ) %>%
-  select(-Media_Valor_Unitario, -SD_Valor_Unitario) %>%
-  ungroup()
+  filter(Preço >= (media_preco - 3 * sd_preco) & Preço <= (media_preco + 3 * sd_preco)) %>%
+  mutate(
+    custo_trans_nor = (Preço - media_preco) / sd_preco
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(custo_trans_nor)) %>%
+  select(-media_preco, -sd_preco)
 
-# ajustar distancia
+## Acrescentar dados eleitorais
 
-df_top_padrao <- df_top_padrao %>%
-  mutate(distancia = distancia / 1000)
+Prefeitos_2016 <- read_excel("Prefeitos 2016.xlsx") %>%
+  select(-ANO)
 
-saveRDS(df_top_padrao, file = "df_top_padrao.rds")
+Prefeitos_2020 <- read_excel("Prefeitos 2020.xlsx")%>%
+  select(-ANO)
+
+Prefeitos_2020$Município <- toupper(Prefeitos_2020$Município)
+Prefeitos_2020$Município <- iconv(Prefeitos_2020$Município, from = "UTF-8", to = "ASCII//TRANSLIT")
+
+Prefeitos_2016$Município <- toupper(Prefeitos_2016$Município)
+Prefeitos_2016$Município <- iconv(Prefeitos_2016$Município, from = "UTF-8", to = "ASCII//TRANSLIT")
+
+# Remover caracteres não alfabéticos dos nomes de municípios
+Prefeitos_2020$Município <- gsub("[^a-zA-Z ]", "", Prefeitos_2020$Município)
+
+Prefeitos_2016$Município <- gsub("[^a-zA-Z ]", "", Prefeitos_2016$Município)
+
+
+# Filtrar o data frame df para o ano de 2019
+df_2019 <- df %>%
+  filter(Ano == 2019)
+
+# Filtrar o data frame df para os anos de 2020 ou maior
+df_2020_onwards <- df %>%
+  filter(Ano >= 2020)
+
+# Unir df_2019 com Prefeitos_2016 pelo município
+df_2019_merged <- df_2019 %>%
+  left_join(Prefeitos_2016, by = c("Município Destinatário" = "Município"))
+
+# Unir df_2020_onwards com Prefeitos_2020 pelo município
+df_2020_merged <- df_2020_onwards %>%
+  left_join(Prefeitos_2020, by = c("Município Destinatário" = "Município"))
+
+# Combinar os dois data frames unidos em um único data frame
+df_final <- bind_rows(df_2019_merged, df_2020_merged)
+
+rm(df_2020_merged,df_2019_merged, df_2019, df_2020_onwards, Prefeitos_2016, Prefeitos_2020)
+
+
+# Corrigir
+
+dados$sexo <- as.factor(dados$sexo)
+dados$partido <- as.factor(dados$partido)
+dados$licit <- as.factor(dados$licit)
+
+
+#Salvar
+saveRDS(dados, file = "dados-novo.rds")
+
 
 
 

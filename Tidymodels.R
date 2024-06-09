@@ -2,43 +2,48 @@ rm(list = ls())
 gc()
 
 library(tidymodels)
-tidymodels_prefer()
-library(baguette)
-library(ranger)
-library(corrplot)
-library(tidyverse)
-library(GGally)
-library(vip)
-library(kableExtra)
+library(recipes)
 library(dplyr)
-library(scales)
-library(kknn)
-library(kernlab)
-library(e1071)
-library(stats)
+library(purrr)
+library(doParallel)
+library(janitor)
+library(stringr)
 library(ggplot2)
+library(vip)
+library(knitr)
 
 
-setwd("~/Dropbox/PPGMMC/Dissertação/Script/Custo_Trans_Licit_Pb")
+rm(list = ls(all = TRUE))
 
-#setwd("C:/Users/brads/Dropbox/PPGMMC/Script/Custo_Trans_Licit_Pb")
+setwd("~/Dropbox/PPGMMC/Dissertação/Script")
 
+# Resolvendo conflitos de pacotes:
+tidymodels::tidymodels_prefer()
 
-df_top_padrao <- 
-  readRDS("df_top_padrao.rds")
+# speed up computation with parallel processing
+registerDoParallel(cores = parallel::detectCores(logical = FALSE)) 
 
-
-
-df_top_padrao <- df_top_padrao[!is.na(df_top_padrao$ReceitaCorrente) & !is.na(df_top_padrao$n_licit),] 
-  
-df_top_padrao <- df_top_padrao %>%
-  mutate(Quantidade = as.numeric(gsub(",", ".", Quantidade)),
-         Licit = as.factor(Licit),
-         distancia = as.numeric(distancia),
-         Custo_Tran_norm = as.vector(Custo_Tran_norm))
-
+# Lendo dados e melhorando nomes ------------------------------------------
+dados <- 
+  readRDS("dados-novo.rds") |>
+  janitor::clean_names() |>
+  janitor::remove_empty("rows") |>
+  janitor::remove_empty("cols")
 
 
+# Separando dados de treino e teste --------------------------------------- 
+set.seed(0)
+dados_split <- initial_split(dados, prop = 0.8, strata = "custo_tran_norm")
+
+# Dados de treinamento
+dados_treinamento <- training(dados_split)
+
+# Dados de teste
+dados_teste <- testing(dados_split)
+
+<<<<<<< HEAD
+# Receita -----------------------------------------------------------------
+=======
 df_top_padrao <- df_top_padrao %>%
   select( c(Custo_Tran_norm, Quantidade, idhm, gini, area_km2, 
             populacao, Tempo_Medio, distancia, ReceitaCorrente, 
@@ -382,109 +387,111 @@ print(vip)
 ## Receita
 
 
+>>>>>>> parent of e18ae2d (Novo commit)
 receita <- 
-  recipe(Custo_Tran_norm ~ Quantidade + `Código Município` + Custo_Tran + pct + 
-         idhm + idhm_edu + idhm_long + idhm_renda + gini + 
-         area_km2 + populacao + Tempo_Medio + distancia + 
-         ReceitaCorrente + Licit + n_licit + Precatorio, data = df_train) 
+  dados_treinamento |>
+  recipes::recipe(custo_tran_norm ~ ., data = _) |>
+  recipes::step_dummy(all_nominal_predictors()) |> 
+  recipes::step_nzv(all_predictors()) |>
+  recipes::step_impute_knn(all_numeric_predictors(), impute_with = imp_vars(quantidade, precatorio)) |>
+  step_corr(all_numeric(), -all_outcomes(), threshold = 0.9)
 
+# Pre-processamento separado do treinamento -------------------------------
+receita_preparada <- prep(receita, training = dados_treinamento)
+dados_treinamento_preparados <- bake(receita_preparada, new_data = NULL)
 
-linear_reg_spec <- 
-  linear_reg(penalty = tune(), mixture = tune()) %>% 
-  set_engine("glmnet")
+# Configurando o modelo ---------------------------------------------------
+modelo <- rand_forest(min_n = tune::tune(), mtry = tune::tune()) |>
+  set_engine('ranger', importance = "impurity", num.threads = parallel::detectCores()) |>
+  set_mode('regression')
 
-nnet_spec <- 
-  mlp(hidden_units = tune(), penalty = tune(), epochs = tune()) %>% 
-  set_engine("nnet", MaxNWts = 2600) %>% 
-  set_mode("regression")
+# Configurando o workflow -------------------------------------------------
+wf <- workflow() |> 
+  add_model(modelo) |>
+  add_formula(custo_tran_norm ~ .)
 
-svm_r_spec <- 
-  svm_rbf(cost = tune(), rbf_sigma = tune()) %>% 
-  set_engine("kernlab") %>% 
-  set_mode("regression")
+# Validacao-cruzada -------------------------------------------------------
+cv <- vfold_cv(dados_treinamento_preparados, v = 5L, strata = custo_tran_norm)
 
-svm_p_spec <- 
-  svm_poly(cost = tune(), degree = tune()) %>% 
-  set_engine("kernlab") %>% 
-  set_mode("regression")
-
-knn_spec <- 
-  nearest_neighbor(neighbors = tune(), dist_power = tune(), weight_func = tune()) %>% 
-  set_engine("kknn") %>% 
-  set_mode("regression")
-
-bag_cart_spec <- 
-  bag_tree() %>% 
-  set_engine("rpart", times = 50L) %>% 
-  set_mode("regression")
-
-rf_spec <- 
-  rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>% 
-  set_engine("ranger") %>% 
-  set_mode("regression")
-
-nnet_param <- 
-  nnet_spec %>% 
-  extract_parameter_set_dials() %>% 
-  update(hidden_units = hidden_units(c(1, 27)))
-
-#WORKFLOW SET
-
-model_vars <- 
-  workflow_variables(outcomes = Custo_Tran_norm, 
-                     predictors = variaveis)
-
-wf_licit <- 
-  workflow_set(
-    preproc = list(simple = model_vars), 
-    models = list(CART_bagged = bag_cart_spec,
-                  RF = rf_spec, SVM_radial = svm_r_spec, SVM_poly = svm_p_spec, 
-                  KNN = knn_spec, neural_network = nnet_spec, 
-                  linear_reg = linear_reg_spec, KNN = knn_spec)
+# Tunando hiperparametros -------------------------------------------------
+tunagem <-
+  tune_grid(
+    wf,
+    resamples = cv,
+    grid = 20L,
+    metrics = metric_set(rsq, yardstick::rmse),
+    control = control_grid(save_pred = TRUE, verbose = TRUE, allow_par = FALSE)
   )
 
-wf_licit <- 
-  workflow_set(
-    preproc = list(simple = model_vars), 
-    models = list(RF = rf_spec)
+# Listando os 10 melhores modelos -----------------------------------------
+tunagem |> 
+  show_best(n = 10L)
+
+ggplot2::autoplot(tunagem)
+
+# Selecionando os melhores hiperparametros --------------------------------
+wf <- 
+  wf |> 
+  remove_formula() |>
+  add_recipe(receita) |>
+  finalize_workflow(select_best(tunagem, metric = "rsq"))
+
+# Avaliando o modelo ------------------------------------------------------
+modelo <- 
+  last_fit(
+    wf, 
+    dados_split, 
+    metrics = metric_set(rsq, yardstick::rmse)
   )
 
+# Visualizando as métricas finais -----------------------------------------
+collect_metrics(modelo)
 
-#TUNING
+# Modelo final ------------------------------------------------------------
+modelo_final <- fit(wf, dados)
 
-grid_ctrl <-
-  control_grid(
-    save_pred = TRUE,
-    parallel_over = "everything",
-    save_workflow = TRUE
-  )
+# Salvando o modelo para usar depois --------------------------------------
+saveRDS(modelo_final, file = "modelo_random_forest.rds")
 
-grid_results <-
-  wf_licit %>%
-  workflow_map(
-    seed = 1981,
-    resamples = dfTrain,
-    grid = 25,
-    control = grid_ctrl
-  )
+# Lendo modelo treinado ---------------------------------------------------
+modelo_carregado <- readRDS("modelo_random_forest.rds")
 
-grid_results %>% 
-  rank_results() %>% 
-  filter(.metric == "rmse") %>% 
-  select(model, .config, rmse = mean, rank)
+# Fazendo previsões no conjunto de dados de teste
+previsoes <- predict(modelo_carregado, new_data = dados_treinamento)
 
+# Combinando previsões com os valores reais
+resultados <- bind_cols(dados_treinamento_preparados, previsoes) |>
+  rename(previsao = .pred)
 
-autoplot(
-  grid_results,
-  rank_metric = "rmse",  
-  metric = "rmse",       
-  select_best = TRUE    
-) +
-  geom_text(aes(y = mean - 1/2, label = wflow_id), angle = 90, hjust = 1) +
-  theme(legend.position = "none")
+# Combinando previsões com os valores reais
+#resultados <- bind_cols(real = dados$custo_tran_norm, estimado = previsoes) 
 
+ggplot(resultados, aes(x = custo_tran_norm, y = previsao)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(
+    title = "Valores Observados vs. Valores Previstos",
+    x = "Valores Observados",
+    y = "Valores Previstos"
+  ) +
+  theme_minimal()
 
-#Screening
+# Extraindo o mecanismo de ajuste
+fit_engine <- modelo_carregado |> 
+  extract_fit_engine()
 
+# Visualizando a importância das variáveis
+vip_plot <- vip(fit_engine) +
+  theme_bw()
 
+# Mostrar o gráfico
+print(vip_plot)
 
+# Calculando as métricas R² e RMSE
+metrics <- resultados |>
+  metrics(truth = custo_tran_norm, estimate = previsao)
+
+# Visualizando as métricas
+print(metrics)
+
+kable(metrics, format = "latex", booktabs = TRUE)
