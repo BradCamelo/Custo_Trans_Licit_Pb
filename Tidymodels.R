@@ -11,11 +11,13 @@ library(stringr)
 library(ggplot2)
 library(vip)
 library(knitr)
-
+library(xgboost)
 
 rm(list = ls(all = TRUE))
 
-setwd("~/Dropbox/PPGMMC/Dissertação/Script")
+#setwd("~/Dropbox/PPGMMC/Dissertação/Script")
+
+setwd("C:/Users/brads/Dropbox/PPGMMC/Dissertação/Script/Custo_Trans_Licit_Pb")
 
 # Resolvendo conflitos de pacotes:
 tidymodels::tidymodels_prefer()
@@ -117,7 +119,8 @@ receita <-
   recipes::recipe(custo_tran_norm ~ ., data = _) |>
   recipes::step_dummy(all_nominal_predictors()) |> 
   recipes::step_nzv(all_predictors()) |>
-  recipes::step_impute_knn(all_numeric_predictors(), impute_with = imp_vars(quantidade, valor_unitario, valor_produtos, precatorio, preco)) |>
+  recipes::step_impute_knn(all_numeric_predictors(), 
+                           impute_with = imp_vars(quantidade, valor_total_nota, precatorio, preco)) |>
   step_corr(all_numeric(), -all_outcomes(), threshold = 0.9)
 
 # Pre-processamento separado do treinamento -------------------------------
@@ -314,3 +317,81 @@ final_metrics <- final_fit %>%
 # Visualizando as métricas
 
 kable(final_metrics, format = "latex", booktabs = TRUE)
+
+## Gradient Boosting ------
+
+modelo <- boost_tree(
+  trees = tune(), 
+  tree_depth = tune(), 
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  learn_rate = tune()
+) |>
+  set_engine("xgboost", nthread = parallel::detectCores()) |>
+  set_mode("regression")
+
+# Configurando o workflow -------------------------------------------------
+wf <- workflow() |> 
+  add_model(modelo) |>
+  add_recipe(receita)
+
+# Validacao-cruzada -------------------------------------------------------
+cv <- vfold_cv(dados_treinamento_preparados, v = 5L, strata = custo_tran_norm)
+
+# Tunando hiperparametros -------------------------------------------------
+tunagem <- 
+  tune_grid(
+    wf,
+    resamples = cv,
+    grid = 20L,
+    metrics = metric_set(rsq, rmse),
+    control = control_grid(save_pred = TRUE, verbose = TRUE)
+  )
+
+# Listando os 10 melhores modelos -----------------------------------------
+top_models <- tunagem |> 
+  show_best(metric = "rsq", n = 10L)
+
+print(top_models)
+
+ggplot2::autoplot(tunagem)
+
+# Selecionando os melhores hiperparametros --------------------------------
+wf <- 
+  wf |> 
+  finalize_workflow(select_best(tunagem, metric = "rsq"))
+
+# Avaliando o modelo ------------------------------------------------------
+split <- initial_split(dados_treinamento)
+modelo_final <- 
+  last_fit(
+    wf, 
+    split, 
+    metrics = metric_set(rsq, rmse, mae)
+  )
+
+# Visualizando as métricas finais -----------------------------------------
+results <- collect_metrics(modelo_final)
+print(results)
+
+# Modelo final ------------------------------------------------------------
+modelo_final <- fit(wf, dados_teste)
+
+#Apresentações
+best_params <- select_best(tunagem, metric = "rmse")
+kable(best_params, caption = "Melhores Hiperparâmetros Encontrados", format = "latex")
+
+predicoes <- predict(modelo_final, dados_teste) |> 
+  bind_cols(dados_teste)
+
+# Gráfico de resultados reais vs previstos
+ggplot(predicoes, aes(x = custo_tran_norm, y = .pred)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  labs(
+    title = "Valores previstos x observados: Gradient Boosting",
+    x = "Valores Observados",
+    y = "Valores previstos"
+  ) +
+  theme_minimal()
